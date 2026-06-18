@@ -26,6 +26,7 @@ session_cache = {}
 async def proxy(path: str, request: Request):
     body = await request.body()
     odoo_url = request.headers.get("x-odoo-url", "https://demotruefood.odoo.com").rstrip("/")
+    db = request.headers.get("x-odoo-db", "")  # ← NUEVO: leer db del header
 
     if not any(odoo_url.startswith(u) for u in ALLOWED_ODOO_URLS):
         return JSONResponse({"error": "URL no permitida"}, status_code=403)
@@ -45,35 +46,38 @@ async def proxy(path: str, request: Request):
     except Exception:
         body_json = {}
 
+    # Si el frontend no mandó db en header, intentar extraerlo del body
+    if not db:
+        db = body_json.get("params", {}).get("db", "")
+
     cache_key = f"{odoo_url}:{user}:{password}"
-    
+
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        # Intentar con sesión cacheada primero
         cookies = session_cache.get(cache_key, {})
-        
+
         if not cookies:
-            # Autenticar para obtener cookies de sesión
-            print(f"Authenticating {user} at {odoo_url}")
+            print(f"Authenticating {user} at {odoo_url}, db={db}")
             auth_resp = await client.post(
                 f"{odoo_url}/web/session/authenticate",
                 json={
                     "jsonrpc": "2.0",
                     "method": "call",
                     "params": {
+                        "db": db,          # ← FIX PRINCIPAL
                         "login": user,
                         "password": password
                     }
                 },
                 headers={"Content-Type": "application/json"}
             )
-            
+
             auth_json = auth_resp.json()
             uid = auth_json.get("result", {}).get("uid")
             print(f"Auth result: uid={uid}, error={auth_json.get('error')}")
-            
+
             if not uid:
                 return JSONResponse(auth_json)
-            
+
             cookies = dict(auth_resp.cookies)
             session_cache[cache_key] = cookies
             print(f"Got cookies: {list(cookies.keys())}")
@@ -85,15 +89,46 @@ async def proxy(path: str, request: Request):
             headers={"Content-Type": "application/json"},
             cookies=cookies
         )
-        
+
         print(f"Response status: {resp.status_code}")
         result = resp.json()
-        
-        # Si la sesión expiró, limpiar cache y reintentar
+
+        # Si la sesión expiró, limpiar cache y reintentar una vez
         if result.get("error", {}).get("code") == 100:
-            print("Session expired, clearing cache")
+            print("Session expired, clearing cache and retrying")
             session_cache.pop(cache_key, None)
-        
+
+            # Reautenticar
+            auth_resp = await client.post(
+                f"{odoo_url}/web/session/authenticate",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "call",
+                    "params": {
+                        "db": db,
+                        "login": user,
+                        "password": password
+                    }
+                },
+                headers={"Content-Type": "application/json"}
+            )
+            auth_json = auth_resp.json()
+            uid = auth_json.get("result", {}).get("uid")
+            if not uid:
+                return JSONResponse(auth_json)
+
+            cookies = dict(auth_resp.cookies)
+            session_cache[cache_key] = cookies
+
+            # Reintentar la llamada original
+            resp = await client.post(
+                f"{odoo_url}/{path}",
+                content=body,
+                headers={"Content-Type": "application/json"},
+                cookies=cookies
+            )
+            result = resp.json()
+
         return JSONResponse(result)
 
 @app.get("/health")
@@ -102,4 +137,4 @@ async def health():
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "True Food Proxy v5"}
+    return {"status": "ok", "message": "True Food Proxy v6"}
