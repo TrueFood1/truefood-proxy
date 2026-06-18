@@ -28,10 +28,9 @@ async def proxy(path: str, request: Request):
     if not any(odoo_url.startswith(u) for u in ALLOWED_ODOO_URLS):
         return JSONResponse({"error": "URL no permitida"}, status_code=403)
 
-    # Extraer usuario y api_key
     auth = request.headers.get("authorization", "")
-    user = ""
     api_key = ""
+    user = ""
     if auth.startswith("Basic "):
         try:
             decoded = base64.b64decode(auth[6:]).decode("utf-8")
@@ -50,57 +49,72 @@ async def proxy(path: str, request: Request):
     args = params.get("args", [])
     kwargs = params.get("kwargs", {})
 
-    print(f"Path: {path}, Model: {model}, Method: {method}, User: {user}, DB: {db}")
+    print(f"Model: {model}, Method: {method}, User: {user}")
 
     async with httpx.AsyncClient(timeout=30) as client:
-        # Paso 1: Autenticar via /jsonrpc para obtener uid
-        auth_payload = {
-            "jsonrpc": "2.0",
-            "method": "call",
-            "id": 1,
-            "params": {
-                "service": "common",
-                "method": "authenticate",
-                "args": [db, user, api_key, {}]
-            }
+        # Usar REST API de Odoo con Bearer token (API key)
+        # Disponible desde Odoo 16 en /api/method/
+        # Para call_kw usar /api/call_kw
+        rest_url = f"{odoo_url}/api/method/{model}.{method}"
+        
+        # Preparar payload para REST API
+        rest_payload = {
+            "args": args,
+            "kwargs": kwargs
         }
-        auth_resp = await client.post(
-            f"{odoo_url}/jsonrpc",
-            json=auth_payload,
-            headers={"Content-Type": "application/json"}
+        
+        print(f"Trying REST API: {rest_url}")
+        
+        rest_resp = await client.post(
+            rest_url,
+            json=rest_payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "DATABASE": db
+            }
         )
-        auth_json = auth_resp.json()
-        uid = auth_json.get("result")
-        print(f"Auth response: uid={uid}, error={auth_json.get('error')}")
-
-        if not uid:
-            return JSONResponse({
+        
+        print(f"REST response status: {rest_resp.status_code}")
+        print(f"REST response: {rest_resp.text[:300]}")
+        
+        if rest_resp.status_code == 200:
+            try:
+                result = rest_resp.json()
+                # Wrap in JSON-RPC format
+                return JSONResponse({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": result
+                })
+            except Exception:
+                pass
+        
+        # Fallback: intentar con /web/dataset/call_kw pasando directamente
+        # (funciona si Odoo acepta Bearer en ese endpoint)
+        print("Trying /web/dataset/call_kw with Bearer token...")
+        kw_resp = await client.post(
+            f"{odoo_url}/web/dataset/call_kw",
+            json={
                 "jsonrpc": "2.0",
-                "error": {
-                    "code": 100,
-                    "message": "Authentication failed",
-                    "data": {"message": str(auth_json.get("error", "Invalid credentials"))}
+                "method": "call",
+                "id": 1,
+                "params": {
+                    "model": model,
+                    "method": method,
+                    "args": args,
+                    "kwargs": kwargs
                 }
-            })
-
-        # Paso 2: Ejecutar la llamada via /jsonrpc con uid y api_key
-        exec_payload = {
-            "jsonrpc": "2.0",
-            "method": "call",
-            "id": 2,
-            "params": {
-                "service": "object",
-                "method": "execute_kw",
-                "args": [db, uid, api_key, model, method, args, kwargs]
+            },
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}"
             }
-        }
-        exec_resp = await client.post(
-            f"{odoo_url}/jsonrpc",
-            json=exec_payload,
-            headers={"Content-Type": "application/json"}
         )
-        result = exec_resp.json()
-        print(f"Execute result (first 200): {json.dumps(result)[:200]}")
+        
+        print(f"call_kw Bearer status: {kw_resp.status_code}")
+        result = kw_resp.json()
+        print(f"call_kw result: {json.dumps(result)[:200]}")
         return JSONResponse(result)
 
 @app.get("/health")
@@ -109,4 +123,4 @@ async def health():
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "True Food Proxy v3"}
+    return {"status": "ok", "message": "True Food Proxy v4"}
